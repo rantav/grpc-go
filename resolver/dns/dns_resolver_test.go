@@ -602,7 +602,7 @@ func generateSCF(name string) []string {
 	if name == "no.attribute" {
 		return div(b)
 	}
-	return div(append([]byte(txtAttribute), b...))
+	return div(append([]byte(txtPrefix), b...))
 }
 
 // generateSC returns a service config string in JSON format for the input name.
