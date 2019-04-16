@@ -15,9 +15,22 @@
  * limitations under the License.
  *
  */
-
 // Package dns implements a dns resolver to be installed as the default resolver
 // in grpc.
+//
+// To use the configurable dns resolver apply this naming:
+// dns-configurable://127.0.0.1:8600?refreshRate=30&lookupSRV=0/attr-endpoint.service.consul.:8080
+//
+// Where:
+//	refreshRate is the DNS query refresh rate in seconds (default: 30 minutes)
+//	lookupSRV may be used to disable SRV records lookup (enabled by default).
+//		Accepts 0, f, F, FALSE, false, False. Other truthy values do not change the default
+//
+// To use this scheme you have to somewhere import this package for side effect
+// import (
+//		_ "gitlab.appsflyer.com/rta/go-af-attr-endpoint/grpc/resolver/dns"
+// )
+//
 package dns
 
 import (
@@ -26,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -38,20 +52,21 @@ import (
 	"google.golang.org/grpc/resolver"
 )
 
-func init() {
-	resolver.Register(NewBuilder())
-}
+// Authority configuration keys
+const (
+	RefreshRateKey = "refreshRate"
+	LookupSRVKey   = "lookupSRV"
+	LookupTXTKey   = "lookupTXT"
+)
 
 const (
-	defaultPort       = "443"
-	defaultFreq       = time.Minute * 30
-	defaultDNSSvrPort = "53"
-	golang            = "GO"
-	// txtPrefix is the prefix string to be prepended to the host name for txt record lookup.
-	txtPrefix = "_grpc_config."
+	defaultPort        = "443"
+	defaultRefreshRate = 30 * time.Minute
+	defaultDNSSvrPort  = "53"
+	golang             = "GO"
 	// In DNS, service config is encoded in a TXT record via the mechanism
 	// described in RFC-1464 using the attribute name grpc_config.
-	txtAttribute = "grpc_config="
+	txtPrefix = "_grpc_config."
 )
 
 var (
@@ -67,6 +82,10 @@ var (
 var (
 	defaultResolver netResolver = net.DefaultResolver
 )
+
+func init() {
+	resolver.Register(NewBuilder())
+}
 
 var customAuthorityDialler = func(authority string) func(ctx context.Context, network, address string) (net.Conn, error) {
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -91,16 +110,84 @@ var customAuthorityResolver = func(authority string) (netResolver, error) {
 
 // NewBuilder creates a dnsBuilder which is used to factory DNS resolvers.
 func NewBuilder() resolver.Builder {
-	return &dnsBuilder{minFreq: defaultFreq}
+	return &dnsBuilder{}
 }
 
-type dnsBuilder struct {
-	// minimum frequency of polling the DNS server.
-	minFreq time.Duration
+type dnsBuilder struct{}
+
+type dnsConfig struct {
+	authority   string
+	refreshRate time.Duration
+	lookupSRV   bool
+	lookupTXT   bool
+}
+
+func (b *dnsBuilder) readConfig(authorityConfig string) (*dnsConfig, error) {
+
+	// defaults
+	authority := ""
+	refreshRate := defaultRefreshRate
+	lookupSRV := true
+	lookupTXT := true
+
+	if authorityConfig != "" {
+		authorityURL, err := url.Parse(fmt.Sprintf("dns://%s", authorityConfig))
+		if err != nil {
+			return nil, err
+		}
+		authority = authorityURL.Host
+		query := authorityURL.Query()
+		refreshRateStr := query.Get(RefreshRateKey)
+		if refreshRateStr != "" {
+			refreshRateInt, err := strconv.Atoi(refreshRateStr)
+			if err != nil {
+				return nil, err
+			}
+			refreshRate = time.Duration(refreshRateInt) * time.Second
+		}
+
+		boolParam := func(key string, defaultValue bool) (bool, error) {
+			str := query.Get(key)
+			if str == "" {
+				return defaultValue, nil
+			}
+			val, err := strconv.ParseBool(str)
+			if err != nil {
+				return false, err
+			}
+			return val, nil
+		}
+
+		lookupSRV, err = boolParam(LookupSRVKey, lookupSRV)
+		if err != nil {
+			return nil, err
+		}
+		lookupTXT, err = boolParam(LookupTXTKey, lookupTXT)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &dnsConfig{
+		authority:   authority,
+		refreshRate: refreshRate,
+		lookupSRV:   lookupSRV,
+		lookupTXT:   lookupTXT,
+	}, nil
 }
 
 // Build creates and starts a DNS resolver that watches the name resolution of the target.
-func (b *dnsBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOption) (resolver.Resolver, error) {
+func (b *dnsBuilder) Build(
+	target resolver.Target,
+	cc resolver.ClientConn,
+	opts resolver.BuildOption,
+) (resolver.Resolver, error) {
+
+	config, err := b.readConfig(target.Authority)
+	if err != nil {
+		return nil, err
+	}
+
 	host, port, err := parseTarget(target.Endpoint, defaultPort)
 	if err != nil {
 		return nil, err
@@ -124,8 +211,8 @@ func (b *dnsBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts 
 	// DNS address (non-IP).
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &dnsResolver{
-		freq:                 b.minFreq,
-		backoff:              backoff.Exponential{MaxDelay: b.minFreq},
+		freq:                 config.refreshRate,
+		backoff:              backoff.Exponential{MaxDelay: config.refreshRate},
 		host:                 host,
 		port:                 port,
 		ctx:                  ctx,
@@ -133,13 +220,14 @@ func (b *dnsBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts 
 		cc:                   cc,
 		t:                    time.NewTimer(0),
 		rn:                   make(chan struct{}, 1),
-		disableServiceConfig: opts.DisableServiceConfig,
+		disableServiceConfig: opts.DisableServiceConfig || !config.lookupTXT,
+		shouldLookupSRV:      config.lookupSRV,
 	}
 
-	if target.Authority == "" {
+	if config.authority == "" {
 		d.resolver = defaultResolver
 	} else {
-		d.resolver, err = customAuthorityResolver(target.Authority)
+		d.resolver, err = customAuthorityResolver(config.authority)
 		if err != nil {
 			return nil, err
 		}
@@ -216,6 +304,9 @@ type dnsResolver struct {
 	// has data race with replaceNetFunc (WRITE the lookup function pointers).
 	wg                   sync.WaitGroup
 	disableServiceConfig bool
+
+	// Whether to run an SRV lookup query
+	shouldLookupSRV bool
 }
 
 // ResolveNow invoke an immediate resolution of the target that this dnsResolver watches.
@@ -259,6 +350,9 @@ func (d *dnsResolver) watcher() {
 
 func (d *dnsResolver) lookupSRV() []resolver.Address {
 	var newAddrs []resolver.Address
+	if !d.shouldLookupSRV {
+		return newAddrs
+	}
 	_, srvs, err := d.resolver.LookupSRV(d.ctx, "grpclb", "tcp", d.host)
 	if err != nil {
 		grpclog.Infof("grpc: failed dns SRV record lookup due to %v.\n", err)
@@ -284,7 +378,7 @@ func (d *dnsResolver) lookupSRV() []resolver.Address {
 }
 
 func (d *dnsResolver) lookupTXT() string {
-	ss, err := d.resolver.LookupTXT(d.ctx, txtPrefix+d.host)
+	ss, err := d.resolver.LookupTXT(d.ctx, d.host)
 	if err != nil {
 		grpclog.Infof("grpc: failed dns TXT record lookup due to %v.\n", err)
 		return ""
@@ -295,11 +389,11 @@ func (d *dnsResolver) lookupTXT() string {
 	}
 
 	// TXT record must have "grpc_config=" attribute in order to be used as service config.
-	if !strings.HasPrefix(res, txtAttribute) {
-		grpclog.Warningf("grpc: TXT record %v missing %v attribute", res, txtAttribute)
+	if !strings.HasPrefix(res, txtPrefix) {
+		grpclog.Warningf("grpc: TXT record %v missing %v attribute", res, txtPrefix)
 		return ""
 	}
-	return strings.TrimPrefix(res, txtAttribute)
+	return strings.TrimPrefix(res, txtPrefix)
 }
 
 func (d *dnsResolver) lookupHost() []resolver.Address {
